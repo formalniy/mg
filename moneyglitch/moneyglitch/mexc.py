@@ -1,7 +1,7 @@
 """Minimal MEXC perpetual futures client.
 
-Uses contract.mexc.com endpoints with HMAC-SHA256 signing as documented at
-https://mexcdevelop.github.io/apidocs/contract_v1_en/
+Uses api.mexc.com endpoints with HMAC-SHA256 signing as documented at
+https://www.mexc.com/api-docs/futures/integration-guide
 
 Sign rule:
     sign_payload = api_key + request_time_ms + (queryString | jsonBody)
@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-BASE_URL = "https://contract.mexc.com"
+BASE_URL = "https://api.mexc.com"  # fixed: was contract.mexc.com
 
 SIDE_OPEN_LONG = 1
 ORDER_TYPE_MARKET = 5
@@ -62,7 +62,7 @@ class MexcFutures:
 
     @staticmethod
     def _check(resp_json: Dict[str, Any]) -> Dict[str, Any]:
-        if resp_json.get("success") is False or resp_json.get("code") not in (0, 200, None):
+        if resp_json.get("success") is False or resp_json.get("code") not in (0, None):
             raise MexcError(f"MEXC error: {resp_json}")
         return resp_json
 
@@ -72,13 +72,15 @@ class MexcFutures:
         return self._check(r.json())
 
     async def _private_post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        body_str = json.dumps(body, separators=(",", ":"), sort_keys=True)
+        # Per docs: POST body is JSON string, no dictionary sorting required
+        body_str = json.dumps(body, separators=(",", ":"))
         rt = self._request_time()
         r = await self.client.post(path, content=body_str, headers=self._headers(rt, body_str))
         r.raise_for_status()
         return self._check(r.json())
 
     async def contract_detail(self, symbol: str) -> Dict[str, Any]:
+        # GET /api/v1/contract/detail — per market endpoints docs
         data = await self._public_get("/api/v1/contract/detail", {"symbol": symbol})
         d = data.get("data")
         if isinstance(d, list):
@@ -88,6 +90,7 @@ class MexcFutures:
         return d
 
     async def ticker(self, symbol: str) -> Dict[str, Any]:
+        # GET /api/v1/contract/ticker — per market endpoints docs
         data = await self._public_get("/api/v1/contract/ticker", {"symbol": symbol})
         d = data.get("data")
         if isinstance(d, list):
@@ -103,6 +106,7 @@ class MexcFutures:
         open_type: int = OPEN_TYPE_ISOLATED,
         position_type: int = POSITION_TYPE_LONG,
     ) -> Dict[str, Any]:
+        # POST /api/v1/private/position/change_leverage — per account/trading docs
         body = {
             "leverage": int(leverage),
             "openType": int(open_type),
@@ -122,6 +126,8 @@ class MexcFutures:
         price: Optional[float] = None,
         stop_loss_price: Optional[float] = None,
     ) -> Dict[str, Any]:
+        # POST /api/v1/private/order/create — per account/trading docs
+        # was: /api/v1/private/order/submit (old contract.mexc.com endpoint)
         body: Dict[str, Any] = {
             "symbol": symbol,
             "vol": int(vol),
@@ -134,7 +140,7 @@ class MexcFutures:
             body["price"] = float(price)
         if stop_loss_price is not None:
             body["stopLossPrice"] = float(stop_loss_price)
-        return await self._private_post("/api/v1/private/order/submit", body)
+        return await self._private_post("/api/v1/private/order/create", body)
 
     async def open_long_market(
         self,
