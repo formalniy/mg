@@ -1,0 +1,17 @@
+{
+  "telegram": {
+    "api_id": 123456,
+    "api_hash": "REPLACE_WITH_API_HASH_FROM_my.telegram.org",
+    "session": "/var/lib/moneyglitch/parser"
+  },
+  "mexc": {
+    "api_key": "REPLACE_WITH_MEXC_FUTURES_API_KEY",
+    "secret": "REPLACE_WITH_MEXC_FUTURES_SECRET",
+    "symbol": "TON_USDT",
+    "open_type": 1
+  },
+  "bot": {
+    "token": "REPLACE_WITH_BOTFATHER_TOKEN",
+    "user_id": 0
+  }
+}

@@ -1,0 +1,24 @@
+[Unit]
+Description=MoneyGlitch control bot (Russian UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=moneyglitch
+Group=moneyglitch
+WorkingDirectory=/var/lib/moneyglitch
+Environment=MONEYGLITCH_CONFIG=/var/lib/moneyglitch/config.json
+Environment=MONEYGLITCH_STATE=/var/lib/moneyglitch/state.json
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/moneyglitch/.venv/bin/python /opt/moneyglitch/run_bot.py
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/moneyglitch
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
