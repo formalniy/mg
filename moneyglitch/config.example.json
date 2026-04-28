@@ -2,7 +2,8 @@
   "telegram": {
     "api_id": 123456,
     "api_hash": "REPLACE_WITH_API_HASH_FROM_my.telegram.org",
-    "session": "/var/lib/moneyglitch/parser"
+    "session": "/var/lib/moneyglitch/parser",
+    "channel": "durov"
   },
   "mexc": {
     "api_key": "REPLACE_WITH_MEXC_FUTURES_API_KEY",
@@ -12,6 +13,6 @@
   },
   "bot": {
     "token": "REPLACE_WITH_BOTFATHER_TOKEN",
-    "user_id": 0
+    "user_ids": [111111111, 222222222]
   }
 }
