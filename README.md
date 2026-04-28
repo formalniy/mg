@@ -44,6 +44,7 @@ are configured live through a Telegram bot with a Russian interface.
 ```bash
 # on a fresh VPS:
 git clone https://github.com/formalniy/mg -b configurable
+cd mg
 cd moneyglitch
 sudo bash deploy/install.sh
 ```
