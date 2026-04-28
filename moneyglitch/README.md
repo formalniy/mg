@@ -43,7 +43,7 @@ are configured live through a Telegram bot with a Russian interface.
 
 ```bash
 # on a fresh VPS:
-git clone <this-repo> moneyglitch
+git clone https://github.com/formalniy/mg
 cd moneyglitch
 sudo bash deploy/install.sh
 ```
