@@ -1,0 +1,33 @@
+{
+  "telegram": {
+    "api_id": 123456,
+    "api_hash": "REPLACE_WITH_API_HASH_FROM_my.telegram.org",
+    "session": "/var/lib/moneyglitch/parser",
+    "channel": "durov"
+  },
+  "bot": {
+    "token": "REPLACE_WITH_BOTFATHER_TOKEN"
+  },
+  "accounts": [
+    {
+      "name": "main",
+      "user_ids": [111111111],
+      "bybit": {
+        "api_key": "REPLACE_WITH_BYBIT_API_KEY_1",
+        "secret": "REPLACE_WITH_BYBIT_SECRET_1",
+        "symbol": "TONUSDT",
+        "isolated": true
+      }
+    },
+    {
+      "name": "alt",
+      "user_ids": [222222222, 333333333],
+      "bybit": {
+        "api_key": "REPLACE_WITH_BYBIT_API_KEY_2",
+        "secret": "REPLACE_WITH_BYBIT_SECRET_2",
+        "symbol": "TONUSDT",
+        "isolated": true
+      }
+    }
+  ]
+}
