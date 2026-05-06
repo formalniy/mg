@@ -198,7 +198,7 @@ class BybitFutures:
             body["stopLoss"] = stop_loss
             body["slTriggerBy"] = sl_trigger_by
             body["slOrderType"] = "Market"
-            body["tpSlMode"] = "Full"
+            body["tpslmode"] = "Full"
         return await self._private_post("/v5/order/create", body)
 
     async def open_long_market(
