@@ -183,7 +183,9 @@ class BybitFutures:
         order_type: str = "Market",
         price: Optional[str] = None,
         stop_loss: Optional[str] = None,
+        take_profit: Optional[str] = None,
         sl_trigger_by: str = "MarkPrice",
+        tp_trigger_by: str = "MarkPrice",
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "category": CATEGORY,
@@ -194,11 +196,16 @@ class BybitFutures:
         }
         if price is not None:
             body["price"] = price
+        if stop_loss is not None or take_profit is not None:
+            body["tpslMode"] = "Full"
         if stop_loss is not None:
             body["stopLoss"] = stop_loss
             body["slTriggerBy"] = sl_trigger_by
             body["slOrderType"] = "Market"
-            body["tpslmode"] = "Full"
+        if take_profit is not None:
+            body["takeProfit"] = take_profit
+            body["tpTriggerBy"] = tp_trigger_by
+            body["tpOrderType"] = "Market"
         return await self._private_post("/v5/order/create", body)
 
     async def open_long_market(
@@ -207,14 +214,16 @@ class BybitFutures:
         amount_usd: float,
         leverage: int,
         stop_loss_pct: float,
+        take_profit_pct: float = 0.0,
         isolated: bool = True,
     ) -> Dict[str, Any]:
         """Open a market long for `amount_usd` margin at `leverage`x with a
-        percentage stop-loss below mark price. qty is sized in base currency.
+        percentage stop-loss below mark price (and optional take-profit above).
+        qty is sized in base currency.
 
-        Returns a dict with: order (raw order create response), qty, sl_price,
-        entry_price (filled avgPrice from position list, falls back to last
-        ticker if the position isn't visible yet)."""
+        take_profit_pct == 0 disables TP. Returns a dict with: order, qty,
+        sl_price, tp_price (or None), entry_price (avgPrice from position list,
+        falls back to last ticker if the position isn't visible yet)."""
         info = await self.instrument_info(symbol)
         tk = await self.ticker(symbol)
 
@@ -234,6 +243,9 @@ class BybitFutures:
             qty = min_qty
 
         sl_price_str = _round_to_tick(last_price * (1.0 - stop_loss_pct / 100.0), tick_size)
+        tp_price_str: Optional[str] = None
+        if take_profit_pct and take_profit_pct > 0:
+            tp_price_str = _round_to_tick(last_price * (1.0 + take_profit_pct / 100.0), tick_size)
 
         try:
             await self.set_leverage(symbol, leverage)
@@ -253,7 +265,9 @@ class BybitFutures:
             qty=qty,
             order_type="Market",
             stop_loss=sl_price_str,
+            take_profit=tp_price_str,
             sl_trigger_by="MarkPrice",
+            tp_trigger_by="MarkPrice",
         )
 
         # Read back the resulting position to capture the actual fill price.
@@ -273,6 +287,7 @@ class BybitFutures:
             "order": order,
             "qty": actual_qty,
             "sl_price": sl_price_str,
+            "tp_price": tp_price_str,
             "entry_price": entry_price,
         }
 

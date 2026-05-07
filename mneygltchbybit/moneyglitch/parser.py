@@ -17,7 +17,7 @@ import html
 import logging
 import re
 import time
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -54,17 +54,25 @@ def render_open_card(
     entry_price: str,
     qty: str,
     sl_price: str,
+    tp_price: Optional[str],
     leverage: int,
     amount_usd: float,
     stop_loss_pct: float,
+    take_profit_pct: float,
 ) -> str:
+    tp_line = (
+        f"TP:      <b>{html.escape(tp_price)}</b> (+{take_profit_pct}%)\n"
+        if tp_price else "TP:      —\n"
+    )
     return (
         f"🟢 <b>LONG {html.escape(account.symbol)}</b> · <code>{html.escape(account.name)}</code>\n"
         f"Entry:   <b>{html.escape(entry_price)}</b>\n"
         f"Current: <b>{html.escape(entry_price)}</b>  (—)\n"
         f"SL:      <b>{html.escape(sl_price)}</b> (-{stop_loss_pct}%)\n"
+        f"{tp_line}"
         f"Qty:     <b>{html.escape(qty)}</b> · плечо {leverage}x · маржа {amount_usd} USD\n"
         f"PnL:     —\n"
+        f"Баланс:  —\n"
         f"Время:   00:00"
     )
 
@@ -98,6 +106,7 @@ async def _trade_for_account(
             amount_usd=float(st["amount_usd"]),
             leverage=int(st["leverage"]),
             stop_loss_pct=float(st["stop_loss_pct"]),
+            take_profit_pct=float(st.get("take_profit_pct") or 0.0),
             isolated=account.isolated,
         )
     except BybitError as e:
@@ -129,9 +138,11 @@ async def _trade_for_account(
         entry_price=result["entry_price"],
         qty=result["qty"],
         sl_price=result["sl_price"],
+        tp_price=result.get("tp_price"),
         leverage=int(st["leverage"]),
         amount_usd=float(st["amount_usd"]),
         stop_loss_pct=float(st["stop_loss_pct"]),
+        take_profit_pct=float(st.get("take_profit_pct") or 0.0),
     )
     markup = close_button_markup(f"close:{account.name}")
     messages = await broadcast_card(bot_token, account.user_ids, text, markup)
@@ -142,8 +153,11 @@ async def _trade_for_account(
         "qty": result["qty"],
         "entry_price": result["entry_price"],
         "sl_price": result["sl_price"],
+        "tp_price": result.get("tp_price"),
         "leverage": int(st["leverage"]),
         "amount_usd": float(st["amount_usd"]),
+        "stop_loss_pct": float(st["stop_loss_pct"]),
+        "take_profit_pct": float(st.get("take_profit_pct") or 0.0),
         "opened_at_ms": int(time.time() * 1000),
         "messages": messages,
         "closing": False,

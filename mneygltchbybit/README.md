@@ -65,7 +65,7 @@ didn't go through.
 
 ```bash
 # on a fresh VPS:
-git clone https://github.com/formalniy/mg -b conf+bybit
+git clone <your-fork-url> mneygltchbybit
 cd mneygltchbybit
 sudo bash deploy/install.sh
 ```

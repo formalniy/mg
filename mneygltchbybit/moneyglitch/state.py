@@ -44,11 +44,12 @@ DEFAULT_ACCOUNT: Dict[str, Any] = {
     "amount_usd": 10.0,
     "leverage": 10,
     "stop_loss_pct": 5.0,
+    "take_profit_pct": 0.0,  # 0 = TP disabled
     "enabled": False,
     "position": None,
 }
 
-_LEGACY_KEYS = {"amount_usd", "leverage", "stop_loss_pct", "enabled"}
+_LEGACY_KEYS = {"amount_usd", "leverage", "stop_loss_pct", "take_profit_pct", "enabled"}
 
 _lock = threading.Lock()
 

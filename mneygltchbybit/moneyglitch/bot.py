@@ -44,12 +44,19 @@ from .state import load_account, patch_position, set_position, update_account
 log = logging.getLogger(__name__)
 
 LIVE_INTERVAL_SECONDS = 1.0
+BALANCE_INTERVAL_SECONDS = 1.0
+
+# Per-account cached USDT wallet snapshot. Populated by balance_updater on
+# its own cadence so the live tick never blocks on a wallet API call.
+# Schema: {<account>: {"equity": str, "wallet": str, "available": str, "ts": int}}
+_BALANCE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 class Form(StatesGroup):
     amount = State()
     leverage = State()
     stop = State()
+    take_profit = State()
 
 
 def main_kb() -> InlineKeyboardMarkup:
@@ -58,7 +65,10 @@ def main_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Сумма (USD)", callback_data="set_amount"),
             InlineKeyboardButton(text="📊 Плечо", callback_data="set_leverage"),
         ],
-        [InlineKeyboardButton(text="🛑 Стоп-лосс (%)", callback_data="set_stop")],
+        [
+            InlineKeyboardButton(text="🛑 Стоп-лосс (%)", callback_data="set_stop"),
+            InlineKeyboardButton(text="🎯 Тейк-профит (%)", callback_data="set_take_profit"),
+        ],
         [
             InlineKeyboardButton(text="▶️ Включить", callback_data="enable"),
             InlineKeyboardButton(text="⏸ Остановить", callback_data="disable"),
@@ -82,13 +92,16 @@ def status_text(account: AccountConfig, st: Dict[str, Any]) -> str:
             f"\n📌 Позиция: <b>{pos.get('side', '?')} {html.escape(str(pos.get('symbol', '')))}</b> "
             f"qty={html.escape(str(pos.get('qty', '?')))} entry={html.escape(str(pos.get('entry_price', '?')))}"
         )
+    tp_pct = float(st.get("take_profit_pct") or 0.0)
+    tp_line = f"Тейк-профит: <b>{tp_pct}%</b>" if tp_pct > 0 else "Тейк-профит: <b>выкл</b>"
     return (
         f"<b>MoneyGlitch · {html.escape(account.symbol)} (perp)</b> · "
         f"<code>{html.escape(account.name)}</code>\n"
         f"Торговля: <b>{flag}</b>\n"
         f"Сумма: <b>{st['amount_usd']}</b> USD\n"
         f"Плечо: <b>{st['leverage']}x</b>\n"
-        f"Стоп-лосс: <b>{st['stop_loss_pct']}%</b>"
+        f"Стоп-лосс: <b>{st['stop_loss_pct']}%</b>\n"
+        f"{tp_line}"
         f"{pos_line}\n\n"
         "Параметры применяются к следующей сделке."
     )
@@ -110,14 +123,31 @@ def _pnl_usd(entry: Decimal, current: Decimal, qty: Decimal, side: str) -> Decim
     return (entry - current) * qty
 
 
+def _balance_line(account_name: str) -> str:
+    bal = _BALANCE_CACHE.get(account_name)
+    if not bal:
+        return "Баланс:  —"
+    eq = bal.get("equity")
+    av = bal.get("available")
+    parts = []
+    if eq is not None:
+        parts.append(f"<b>{eq}</b> USDT")
+    if av is not None:
+        parts.append(f"avail {av}")
+    return "Баланс:  " + (" · ".join(parts) if parts else "—")
+
+
 def render_live_card(account: AccountConfig, pos: Dict[str, Any], current_price: float) -> str:
     entry = Decimal(str(pos.get("entry_price") or "0"))
     qty = Decimal(str(pos.get("qty") or "0"))
     cur = Decimal(str(current_price))
     side = str(pos.get("side") or "Long")
     sl = str(pos.get("sl_price") or "—")
+    tp = pos.get("tp_price")
     leverage = int(pos.get("leverage") or 1)
     amount_usd = float(pos.get("amount_usd") or 0)
+    tp_pct = float(pos.get("take_profit_pct") or 0.0)
+    sl_pct = float(pos.get("stop_loss_pct") or 0.0)
 
     pnl = _pnl_usd(entry, cur, qty, side)
     price_pct = (cur - entry) / entry * 100 if entry > 0 else Decimal(0)
@@ -125,14 +155,21 @@ def render_live_card(account: AccountConfig, pos: Dict[str, Any], current_price:
     arrow = "▲" if cur >= entry else "▼"
     sign = "+" if pnl >= 0 else ""
 
+    sl_line = f"SL:      <b>{html.escape(sl)}</b>"
+    if sl_pct:
+        sl_line += f" (-{sl_pct}%)"
+    tp_line = f"TP:      <b>{html.escape(str(tp))}</b>" + (f" (+{tp_pct}%)" if tp_pct else "") if tp else "TP:      —"
+
     return (
         f"🟢 <b>{html.escape(side.upper())} {html.escape(account.symbol)}</b> · "
         f"<code>{html.escape(account.name)}</code>\n"
         f"Entry:   <b>{entry}</b>\n"
         f"Current: <b>{cur}</b>  {arrow} {price_pct:+.2f}%\n"
-        f"SL:      <b>{html.escape(sl)}</b>\n"
+        f"{sl_line}\n"
+        f"{tp_line}\n"
         f"Qty:     <b>{qty}</b> · плечо {leverage}x · маржа {amount_usd} USD\n"
         f"PnL:     <b>{sign}{pnl:.4f} USD</b>  ({margin_pct:+.2f}% от маржи)\n"
+        f"{_balance_line(account.name)}\n"
         f"Время:   {_fmt_elapsed(int(pos.get('opened_at_ms') or 0))}"
     )
 
@@ -168,6 +205,7 @@ def render_closed_card(
         f"Exit:     <b>{ex}</b>  ({price_pct:+.2f}%)\n"
         f"Qty:      <b>{qty}</b> · плечо {leverage}x · маржа {amount_usd} USD\n"
         f"PnL:      <b>{sign}{pnl:.4f} USD</b>  ({margin_pct:+.2f}% от маржи)\n"
+        f"{_balance_line(account.name)}\n"
         f"Длит-ть:  {dur}"
     )
 
@@ -276,6 +314,12 @@ def build_dispatcher(
         elif data == "set_stop":
             await state.set_state(Form.stop)
             await q.message.answer("Введите стоп-лосс в %, 0–100 (например, <code>5</code>):", parse_mode="HTML")
+        elif data == "set_take_profit":
+            await state.set_state(Form.take_profit)
+            await q.message.answer(
+                "Введите тейк-профит в %, 0–500 (0 — отключить, например, <code>10</code>):",
+                parse_mode="HTML",
+            )
 
         await q.answer()
 
@@ -326,6 +370,23 @@ def build_dispatcher(
         update_account(a.name, stop_loss_pct=v)
         await state.clear()
         await m.answer(f"🛑 Стоп-лосс: <b>{v}%</b>", parse_mode="HTML", reply_markup=main_kb())
+
+    @dp.message(Form.take_profit)
+    async def in_tp(m: Message, state: FSMContext) -> None:
+        a = acct_for_msg(m)
+        if not a:
+            return
+        try:
+            v = float((m.text or "").replace(",", ".").strip())
+            if not (0 <= v <= 500):
+                raise ValueError
+        except ValueError:
+            await m.answer("Введите число от 0 до 500 (0 — отключить):")
+            return
+        update_account(a.name, take_profit_pct=v)
+        await state.clear()
+        label = f"<b>{v}%</b>" if v > 0 else "<b>выкл</b>"
+        await m.answer(f"🎯 Тейк-профит: {label}", parse_mode="HTML", reply_markup=main_kb())
 
     return dp
 
@@ -436,6 +497,56 @@ async def live_updater(
         await asyncio.sleep(LIVE_INTERVAL_SECONDS)
 
 
+def _extract_usdt(wallet_resp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = ((wallet_resp or {}).get("result") or {}).get("list") or []
+    for row in rows:
+        for coin in row.get("coin", []) or []:
+            if str(coin.get("coin", "")).upper() == "USDT":
+                return coin
+    return None
+
+
+async def _balance_tick(account: AccountConfig, bybit: BybitFutures) -> None:
+    pos = (load_account(account.name) or {}).get("position")
+    if not pos or not pos.get("symbol"):
+        # No position → drop the cached entry so a stale value can't render.
+        _BALANCE_CACHE.pop(account.name, None)
+        return
+    try:
+        wb = await bybit.wallet_balance("UNIFIED")
+    except Exception as e:  # noqa: BLE001
+        log.debug("wallet_balance failed for %s: %s", account.name, e)
+        return
+    usdt = _extract_usdt(wb)
+    if not usdt:
+        return
+    _BALANCE_CACHE[account.name] = {
+        "equity": usdt.get("equity"),
+        "wallet": usdt.get("walletBalance"),
+        "available": usdt.get("availableToWithdraw") or usdt.get("availableBalance"),
+        "ts": int(time.time() * 1000),
+    }
+
+
+async def balance_updater(
+    accounts: List[AccountConfig],
+    bybit_clients: Dict[str, BybitFutures],
+) -> None:
+    """Refresh USDT wallet snapshot per account on its own cadence.
+
+    Decoupled from live_updater so a slow wallet_balance call never delays
+    the price/PnL message edit. Only runs the API call when a position is
+    open — idle accounts incur zero load."""
+    while True:
+        try:
+            await asyncio.gather(*(
+                _balance_tick(a, bybit_clients[a.name]) for a in accounts
+            ), return_exceptions=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("balance updater iteration error: %s", e)
+        await asyncio.sleep(BALANCE_INTERVAL_SECONDS)
+
+
 async def run_bot(config: Dict[str, Any]) -> None:
     bot_cfg = config["bot"]
     bot = Bot(token=str(bot_cfg["token"]))
@@ -453,12 +564,15 @@ async def run_bot(config: Dict[str, Any]) -> None:
 
     log.info("bot polling started; accounts=%s", [a.name for a in accounts])
     live_task = asyncio.create_task(live_updater(bot, accounts, bybit_clients))
+    bal_task = asyncio.create_task(balance_updater(accounts, bybit_clients))
     try:
         await dp.start_polling(bot)
     finally:
-        live_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await live_task
+        for t in (live_task, bal_task):
+            t.cancel()
+        for t in (live_task, bal_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
         await asyncio.gather(
             *(c.aclose() for c in bybit_clients.values()),
             return_exceptions=True,
