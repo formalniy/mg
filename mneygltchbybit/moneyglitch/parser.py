@@ -59,17 +59,25 @@ def render_open_card(
     amount_usd: float,
     stop_loss_pct: float,
     take_profit_pct: float,
+    neutral_tp_price: Optional[str] = None,
+    neutral_tp_qty: Optional[str] = None,
 ) -> str:
     tp_line = (
-        f"TP:      <b>{html.escape(tp_price)}</b> (+{take_profit_pct}%)\n"
+        f"TP:      <b>{html.escape(tp_price)}</b> (+{take_profit_pct}% маржи)\n"
         if tp_price else "TP:      —\n"
+    )
+    neutral_line = (
+        f"🧮 TP-фи: <b>{html.escape(neutral_tp_price)}</b> · "
+        f"qty <b>{html.escape(neutral_tp_qty or '?')}</b>\n"
+        if neutral_tp_price else ""
     )
     return (
         f"🟢 <b>LONG {html.escape(account.symbol)}</b> · <code>{html.escape(account.name)}</code>\n"
         f"Entry:   <b>{html.escape(entry_price)}</b>\n"
         f"Current: <b>{html.escape(entry_price)}</b>  (—)\n"
-        f"SL:      <b>{html.escape(sl_price)}</b> (-{stop_loss_pct}%)\n"
+        f"SL:      <b>{html.escape(sl_price)}</b> (-{stop_loss_pct}% маржи)\n"
         f"{tp_line}"
+        f"{neutral_line}"
         f"Qty:     <b>{html.escape(qty)}</b> · плечо {leverage}x · маржа {amount_usd} USD\n"
         f"PnL:     —\n"
         f"Баланс:  —\n"
@@ -108,6 +116,7 @@ async def _trade_for_account(
             stop_loss_pct=float(st["stop_loss_pct"]),
             take_profit_pct=float(st.get("take_profit_pct") or 0.0),
             isolated=account.isolated,
+            fee_neutralize=bool(st.get("fee_neutralize_enabled") or False),
         )
     except BybitError as e:
         await asyncio.gather(*(
@@ -143,6 +152,8 @@ async def _trade_for_account(
         amount_usd=float(st["amount_usd"]),
         stop_loss_pct=float(st["stop_loss_pct"]),
         take_profit_pct=float(st.get("take_profit_pct") or 0.0),
+        neutral_tp_price=result.get("neutral_tp_price"),
+        neutral_tp_qty=result.get("neutral_tp_qty"),
     )
     markup = close_button_markup(f"close:{account.name}")
     messages = await broadcast_card(bot_token, account.user_ids, text, markup)
@@ -158,6 +169,11 @@ async def _trade_for_account(
         "amount_usd": float(st["amount_usd"]),
         "stop_loss_pct": float(st["stop_loss_pct"]),
         "take_profit_pct": float(st.get("take_profit_pct") or 0.0),
+        "fee_neutralize_enabled": bool(st.get("fee_neutralize_enabled") or False),
+        "neutral_tp_price": result.get("neutral_tp_price"),
+        "neutral_tp_qty": result.get("neutral_tp_qty"),
+        "neutral_tp_order_id": result.get("neutral_tp_order_id"),
+        "main_tp_order_id": result.get("main_tp_order_id"),
         "opened_at_ms": int(time.time() * 1000),
         "messages": messages,
         "closing": False,

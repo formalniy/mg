@@ -43,13 +43,17 @@ STATE_PATH = Path(os.environ.get("MONEYGLITCH_STATE", "state.json"))
 DEFAULT_ACCOUNT: Dict[str, Any] = {
     "amount_usd": 10.0,
     "leverage": 10,
-    "stop_loss_pct": 5.0,
-    "take_profit_pct": 0.0,  # 0 = TP disabled
+    "stop_loss_pct": 5.0,           # margin %, divided by leverage at open time
+    "take_profit_pct": 0.0,          # margin %, 0 = TP disabled
+    "fee_neutralize_enabled": False, # auto partial-TP that banks 3× est. fees
     "enabled": False,
     "position": None,
 }
 
-_LEGACY_KEYS = {"amount_usd", "leverage", "stop_loss_pct", "take_profit_pct", "enabled"}
+_LEGACY_KEYS = {
+    "amount_usd", "leverage", "stop_loss_pct", "take_profit_pct",
+    "fee_neutralize_enabled", "enabled",
+}
 
 _lock = threading.Lock()
 

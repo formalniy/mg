@@ -59,16 +59,21 @@ class Form(StatesGroup):
     take_profit = State()
 
 
-def main_kb() -> InlineKeyboardMarkup:
+def main_kb(fee_neutralize: bool = False) -> InlineKeyboardMarkup:
+    fn_label = (
+        "🧮 Нейтрализация: ВКЛ" if fee_neutralize
+        else "🧮 Нейтрализация: ВЫКЛ"
+    )
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="💰 Сумма (USD)", callback_data="set_amount"),
             InlineKeyboardButton(text="📊 Плечо", callback_data="set_leverage"),
         ],
         [
-            InlineKeyboardButton(text="🛑 Стоп-лосс (%)", callback_data="set_stop"),
-            InlineKeyboardButton(text="🎯 Тейк-профит (%)", callback_data="set_take_profit"),
+            InlineKeyboardButton(text="🛑 Стоп-лосс (% маржи)", callback_data="set_stop"),
+            InlineKeyboardButton(text="🎯 Тейк-профит (% маржи)", callback_data="set_take_profit"),
         ],
+        [InlineKeyboardButton(text=fn_label, callback_data="toggle_fn")],
         [
             InlineKeyboardButton(text="▶️ Включить", callback_data="enable"),
             InlineKeyboardButton(text="⏸ Остановить", callback_data="disable"),
@@ -93,15 +98,18 @@ def status_text(account: AccountConfig, st: Dict[str, Any]) -> str:
             f"qty={html.escape(str(pos.get('qty', '?')))} entry={html.escape(str(pos.get('entry_price', '?')))}"
         )
     tp_pct = float(st.get("take_profit_pct") or 0.0)
-    tp_line = f"Тейк-профит: <b>{tp_pct}%</b>" if tp_pct > 0 else "Тейк-профит: <b>выкл</b>"
+    tp_line = f"Тейк-профит: <b>{tp_pct}% маржи</b>" if tp_pct > 0 else "Тейк-профит: <b>выкл</b>"
+    fn_on = bool(st.get("fee_neutralize_enabled") or False)
+    fn_line = "Нейтрализация: <b>ВКЛ</b>" if fn_on else "Нейтрализация: <b>выкл</b>"
     return (
         f"<b>MoneyGlitch · {html.escape(account.symbol)} (perp)</b> · "
         f"<code>{html.escape(account.name)}</code>\n"
         f"Торговля: <b>{flag}</b>\n"
         f"Сумма: <b>{st['amount_usd']}</b> USD\n"
         f"Плечо: <b>{st['leverage']}x</b>\n"
-        f"Стоп-лосс: <b>{st['stop_loss_pct']}%</b>\n"
-        f"{tp_line}"
+        f"Стоп-лосс: <b>{st['stop_loss_pct']}% маржи</b>\n"
+        f"{tp_line}\n"
+        f"{fn_line}"
         f"{pos_line}\n\n"
         "Параметры применяются к следующей сделке."
     )
@@ -157,8 +165,19 @@ def render_live_card(account: AccountConfig, pos: Dict[str, Any], current_price:
 
     sl_line = f"SL:      <b>{html.escape(sl)}</b>"
     if sl_pct:
-        sl_line += f" (-{sl_pct}%)"
-    tp_line = f"TP:      <b>{html.escape(str(tp))}</b>" + (f" (+{tp_pct}%)" if tp_pct else "") if tp else "TP:      —"
+        sl_line += f" (-{sl_pct}% маржи)"
+    tp_line = (
+        f"TP:      <b>{html.escape(str(tp))}</b>"
+        + (f" (+{tp_pct}% маржи)" if tp_pct else "")
+        if tp else "TP:      —"
+    )
+    neutral_tp = pos.get("neutral_tp_price")
+    neutral_qty = pos.get("neutral_tp_qty")
+    neutral_line = (
+        f"\n🧮 TP-фи: <b>{html.escape(str(neutral_tp))}</b> · "
+        f"qty <b>{html.escape(str(neutral_qty or '?'))}</b>"
+        if neutral_tp else ""
+    )
 
     return (
         f"🟢 <b>{html.escape(side.upper())} {html.escape(account.symbol)}</b> · "
@@ -166,7 +185,7 @@ def render_live_card(account: AccountConfig, pos: Dict[str, Any], current_price:
         f"Entry:   <b>{entry}</b>\n"
         f"Current: <b>{cur}</b>  {arrow} {price_pct:+.2f}%\n"
         f"{sl_line}\n"
-        f"{tp_line}\n"
+        f"{tp_line}{neutral_line}\n"
         f"Qty:     <b>{qty}</b> · плечо {leverage}x · маржа {amount_usd} USD\n"
         f"PnL:     <b>{sign}{pnl:.4f} USD</b>  ({margin_pct:+.2f}% от маржи)\n"
         f"{_balance_line(account.name)}\n"
@@ -265,16 +284,24 @@ def build_dispatcher(
         if not a:
             return
         await state.clear()
-        await m.answer(status_text(a, load_account(a.name)),
-                       reply_markup=main_kb(), parse_mode="HTML")
+        st = load_account(a.name)
+        await m.answer(
+            status_text(a, st),
+            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            parse_mode="HTML",
+        )
 
     @dp.message(Command("status"))
     async def cmd_status(m: Message) -> None:
         a = acct_for_msg(m)
         if not a:
             return
-        await m.answer(status_text(a, load_account(a.name)),
-                       reply_markup=main_kb(), parse_mode="HTML")
+        st = load_account(a.name)
+        await m.answer(
+            status_text(a, st),
+            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            parse_mode="HTML",
+        )
 
     @dp.callback_query()
     async def on_cb(q: CallbackQuery, state: FSMContext) -> None:
@@ -294,16 +321,36 @@ def build_dispatcher(
 
         st = load_account(a.name)
         if data == "status":
-            await _safe_edit_callback_msg(q, status_text(a, st), main_kb())
+            await _safe_edit_callback_msg(
+                q, status_text(a, st),
+                main_kb(bool(st.get("fee_neutralize_enabled"))),
+            )
         elif data == "enable":
             st = update_account(a.name, enabled=True)
-            await _safe_edit_callback_msg(q, status_text(a, st), main_kb())
+            await _safe_edit_callback_msg(
+                q, status_text(a, st),
+                main_kb(bool(st.get("fee_neutralize_enabled"))),
+            )
             await q.answer("Торговля включена")
             return
         elif data == "disable":
             st = update_account(a.name, enabled=False)
-            await _safe_edit_callback_msg(q, status_text(a, st), main_kb())
+            await _safe_edit_callback_msg(
+                q, status_text(a, st),
+                main_kb(bool(st.get("fee_neutralize_enabled"))),
+            )
             await q.answer("Торговля выключена")
+            return
+        elif data == "toggle_fn":
+            new_val = not bool(st.get("fee_neutralize_enabled") or False)
+            st = update_account(a.name, fee_neutralize_enabled=new_val)
+            await _safe_edit_callback_msg(
+                q, status_text(a, st), main_kb(new_val),
+            )
+            await q.answer(
+                "Нейтрализация комиссии: ВКЛ" if new_val
+                else "Нейтрализация комиссии: ВЫКЛ"
+            )
             return
         elif data == "set_amount":
             await state.set_state(Form.amount)
@@ -313,11 +360,16 @@ def build_dispatcher(
             await q.message.answer("Введите плечо целым числом, 1–200 (например, <code>10</code>):", parse_mode="HTML")
         elif data == "set_stop":
             await state.set_state(Form.stop)
-            await q.message.answer("Введите стоп-лосс в %, 0–100 (например, <code>5</code>):", parse_mode="HTML")
+            await q.message.answer(
+                "Введите стоп-лосс в % от маржи (с плечом), 0–100 "
+                "(например, <code>20</code> при плече 50x = -0.4% к цене):",
+                parse_mode="HTML",
+            )
         elif data == "set_take_profit":
             await state.set_state(Form.take_profit)
             await q.message.answer(
-                "Введите тейк-профит в %, 0–500 (0 — отключить, например, <code>10</code>):",
+                "Введите тейк-профит в % от маржи (с плечом), 0–10000 "
+                "(0 — отключить, например, <code>200</code> при плече 50x = +4% к цене):",
                 parse_mode="HTML",
             )
 
@@ -335,9 +387,13 @@ def build_dispatcher(
         except ValueError:
             await m.answer("Некорректная сумма. Введите положительное число:")
             return
-        update_account(a.name, amount_usd=v)
+        st = update_account(a.name, amount_usd=v)
         await state.clear()
-        await m.answer(f"💰 Сумма: <b>{v} USD</b>", parse_mode="HTML", reply_markup=main_kb())
+        await m.answer(
+            f"💰 Сумма: <b>{v} USD</b>",
+            parse_mode="HTML",
+            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+        )
 
     @dp.message(Form.leverage)
     async def in_lev(m: Message, state: FSMContext) -> None:
@@ -351,9 +407,13 @@ def build_dispatcher(
         except ValueError:
             await m.answer("Введите целое число от 1 до 200:")
             return
-        update_account(a.name, leverage=v)
+        st = update_account(a.name, leverage=v)
         await state.clear()
-        await m.answer(f"📊 Плечо: <b>{v}x</b>", parse_mode="HTML", reply_markup=main_kb())
+        await m.answer(
+            f"📊 Плечо: <b>{v}x</b>",
+            parse_mode="HTML",
+            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+        )
 
     @dp.message(Form.stop)
     async def in_stop(m: Message, state: FSMContext) -> None:
@@ -367,9 +427,13 @@ def build_dispatcher(
         except ValueError:
             await m.answer("Введите число больше 0 и меньше 100:")
             return
-        update_account(a.name, stop_loss_pct=v)
+        st = update_account(a.name, stop_loss_pct=v)
         await state.clear()
-        await m.answer(f"🛑 Стоп-лосс: <b>{v}%</b>", parse_mode="HTML", reply_markup=main_kb())
+        await m.answer(
+            f"🛑 Стоп-лосс: <b>{v}% маржи</b>",
+            parse_mode="HTML",
+            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+        )
 
     @dp.message(Form.take_profit)
     async def in_tp(m: Message, state: FSMContext) -> None:
@@ -378,15 +442,19 @@ def build_dispatcher(
             return
         try:
             v = float((m.text or "").replace(",", ".").strip())
-            if not (0 <= v <= 500):
+            if not (0 <= v <= 10000):
                 raise ValueError
         except ValueError:
-            await m.answer("Введите число от 0 до 500 (0 — отключить):")
+            await m.answer("Введите число от 0 до 10000 (0 — отключить):")
             return
-        update_account(a.name, take_profit_pct=v)
+        st = update_account(a.name, take_profit_pct=v)
         await state.clear()
-        label = f"<b>{v}%</b>" if v > 0 else "<b>выкл</b>"
-        await m.answer(f"🎯 Тейк-профит: {label}", parse_mode="HTML", reply_markup=main_kb())
+        label = f"<b>{v}% маржи</b>" if v > 0 else "<b>выкл</b>"
+        await m.answer(
+            f"🎯 Тейк-профит: {label}",
+            parse_mode="HTML",
+            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+        )
 
     return dp
 
@@ -412,7 +480,25 @@ async def _handle_close(
     position_side = "Buy" if side.lower().startswith("l") else "Sell"
     qty = str(pos.get("qty") or "0")
 
+    # Cancel any pending fee-neutralize / main-TP reduceOnly Limit orders
+    # before market-closing — leftover Limits would otherwise sit on the
+    # book and could fire on a later position. cancel-all is idempotent.
     try:
+        await bybit.cancel_all_orders(account.symbol)
+    except Exception as e:  # noqa: BLE001
+        log.debug("pre-close cancel_all_orders failed for %s: %s", account.name, e)
+
+    try:
+        # Live position size may be smaller than what we tracked at open
+        # (fee-neutralize partial TP may already have fired). Read current
+        # size so reduceOnly close hits exactly what's there.
+        try:
+            live_pos = await bybit.get_open_position(account.symbol)
+            if live_pos and Decimal(str(live_pos.get("size") or "0")) > 0:
+                qty = str(live_pos.get("size"))
+        except Exception as e:  # noqa: BLE001
+            log.debug("live position read failed for %s: %s", account.name, e)
+
         await bybit.close_position_market(account.symbol, qty, position_side=position_side)
     except BybitError as e:
         patch_position(account.name, closing=False)
