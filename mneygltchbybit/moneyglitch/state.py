@@ -47,12 +47,19 @@ DEFAULT_ACCOUNT: Dict[str, Any] = {
     "take_profit_pct": 0.0,          # margin %, 0 = TP disabled
     "fee_neutralize_enabled": False, # auto partial-TP that banks 3× est. fees
     "enabled": False,
+    # Four user-configurable quick-sell buttons. Each closes the given % of
+    # the live position via a reduceOnly market order when clicked.
+    "sell_pct_1": 25.0,
+    "sell_pct_2": 50.0,
+    "sell_pct_3": 75.0,
+    "sell_pct_4": 100.0,
     "position": None,
 }
 
 _LEGACY_KEYS = {
     "amount_usd", "leverage", "stop_loss_pct", "take_profit_pct",
     "fee_neutralize_enabled", "enabled",
+    "sell_pct_1", "sell_pct_2", "sell_pct_3", "sell_pct_4",
 }
 
 _lock = threading.Lock()

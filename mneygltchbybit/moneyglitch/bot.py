@@ -38,18 +38,26 @@ from aiogram.types import (
 )
 
 from .accounts import AccountConfig, account_for_user, load_accounts
-from .bybit import BybitError, BybitFutures
+from .bybit import BybitError, BybitFutures, _qty_step_floor
 from .state import load_account, patch_position, set_position, update_account
 
 log = logging.getLogger(__name__)
 
 LIVE_INTERVAL_SECONDS = 1.0
 BALANCE_INTERVAL_SECONDS = 1.0
+# fee_rate rarely changes; refetch once per hour at most.
+FEE_CACHE_TTL_MS = 60 * 60 * 1000
+# /start balance call is on-demand; reuse a fresh cached value within ~10s
+# so back-to-back status refreshes don't spam wallet-balance.
+STATUS_BALANCE_TTL_MS = 10_000
 
 # Per-account cached USDT wallet snapshot. Populated by balance_updater on
 # its own cadence so the live tick never blocks on a wallet API call.
 # Schema: {<account>: {"equity": str, "wallet": str, "available": str, "ts": int}}
 _BALANCE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# Per-account cached taker fee rate. {<account>: {"fee": Decimal, "ts": int}}
+_FEE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 class Form(StatesGroup):
@@ -57,13 +65,36 @@ class Form(StatesGroup):
     leverage = State()
     stop = State()
     take_profit = State()
+    sell_pct_1 = State()
+    sell_pct_2 = State()
+    sell_pct_3 = State()
+    sell_pct_4 = State()
 
 
-def main_kb(fee_neutralize: bool = False) -> InlineKeyboardMarkup:
+def _fmt_pct(v: Any) -> str:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{f:g}"
+
+
+def _sell_pcts(st: Dict[str, Any]) -> List[float]:
+    out: List[float] = []
+    for i in range(1, 5):
+        try:
+            out.append(float(st.get(f"sell_pct_{i}") or 0))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    return out
+
+
+def main_kb(st: Dict[str, Any]) -> InlineKeyboardMarkup:
     fn_label = (
-        "🧮 Нейтрализация: ВКЛ" if fee_neutralize
+        "🧮 Нейтрализация: ВКЛ" if st.get("fee_neutralize_enabled")
         else "🧮 Нейтрализация: ВЫКЛ"
     )
+    p = _sell_pcts(st)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="💰 Сумма (USD)", callback_data="set_amount"),
@@ -75,6 +106,14 @@ def main_kb(fee_neutralize: bool = False) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text=fn_label, callback_data="toggle_fn")],
         [
+            InlineKeyboardButton(text=f"💸 Продажа №1: {_fmt_pct(p[0])}%", callback_data="set_sell_1"),
+            InlineKeyboardButton(text=f"💸 Продажа №2: {_fmt_pct(p[1])}%", callback_data="set_sell_2"),
+        ],
+        [
+            InlineKeyboardButton(text=f"💸 Продажа №3: {_fmt_pct(p[2])}%", callback_data="set_sell_3"),
+            InlineKeyboardButton(text=f"💸 Продажа №4: {_fmt_pct(p[3])}%", callback_data="set_sell_4"),
+        ],
+        [
             InlineKeyboardButton(text="▶️ Включить", callback_data="enable"),
             InlineKeyboardButton(text="⏸ Остановить", callback_data="disable"),
         ],
@@ -82,10 +121,47 @@ def main_kb(fee_neutralize: bool = False) -> InlineKeyboardMarkup:
     ])
 
 
-def close_kb(account_name: str) -> InlineKeyboardMarkup:
+def close_kb(account_name: str, sell_pcts: List[float]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"💸 {_fmt_pct(sell_pcts[0])}%", callback_data=f"sell:{account_name}:1"),
+            InlineKeyboardButton(text=f"💸 {_fmt_pct(sell_pcts[1])}%", callback_data=f"sell:{account_name}:2"),
+        ],
+        [
+            InlineKeyboardButton(text=f"💸 {_fmt_pct(sell_pcts[2])}%", callback_data=f"sell:{account_name}:3"),
+            InlineKeyboardButton(text=f"💸 {_fmt_pct(sell_pcts[3])}%", callback_data=f"sell:{account_name}:4"),
+        ],
         [InlineKeyboardButton(text="🔴 Закрыть позицию", callback_data=f"close:{account_name}")]
     ])
+
+
+def _status_balance_line(account_name: str) -> str:
+    bal = _BALANCE_CACHE.get(account_name)
+    if not bal:
+        return "Баланс: <b>—</b>"
+    eq = bal.get("equity")
+    av = bal.get("available")
+    parts = []
+    if eq is not None:
+        parts.append(f"<b>{eq}</b> USDT")
+    if av is not None:
+        parts.append(f"доступно <b>{av}</b>")
+    return "Баланс: " + (" · ".join(parts) if parts else "<b>—</b>")
+
+
+def _fee_line(account_name: str, amount_usd: float, leverage: int) -> str:
+    cached = _FEE_CACHE.get(account_name)
+    if not cached:
+        return "Комиссия откр.+закр.: <b>—</b>"
+    fee = cached["fee"]  # Decimal
+    notional = Decimal(str(amount_usd)) * Decimal(int(leverage))
+    one_side = notional * fee
+    round_trip = one_side * Decimal(2)
+    fee_pct = fee * Decimal(100)
+    return (
+        f"Комиссия откр./закр.: <b>{one_side:.4f}</b> / <b>{one_side:.4f}</b> USDT · "
+        f"итого <b>{round_trip:.4f}</b> (тейкер {fee_pct:.4f}%)"
+    )
 
 
 def status_text(account: AccountConfig, st: Dict[str, Any]) -> str:
@@ -101,6 +177,12 @@ def status_text(account: AccountConfig, st: Dict[str, Any]) -> str:
     tp_line = f"Тейк-профит: <b>{tp_pct}% маржи</b>" if tp_pct > 0 else "Тейк-профит: <b>выкл</b>"
     fn_on = bool(st.get("fee_neutralize_enabled") or False)
     fn_line = "Нейтрализация: <b>ВКЛ</b>" if fn_on else "Нейтрализация: <b>выкл</b>"
+    balance_line = _status_balance_line(account.name)
+    fee_line = _fee_line(
+        account.name,
+        float(st.get("amount_usd") or 0),
+        int(st.get("leverage") or 1),
+    )
     return (
         f"<b>MoneyGlitch · {html.escape(account.symbol)} (perp)</b> · "
         f"<code>{html.escape(account.name)}</code>\n"
@@ -109,7 +191,9 @@ def status_text(account: AccountConfig, st: Dict[str, Any]) -> str:
         f"Плечо: <b>{st['leverage']}x</b>\n"
         f"Стоп-лосс: <b>{st['stop_loss_pct']}% маржи</b>\n"
         f"{tp_line}\n"
-        f"{fn_line}"
+        f"{fn_line}\n"
+        f"{balance_line}\n"
+        f"{fee_line}"
         f"{pos_line}\n\n"
         "Параметры применяются к следующей сделке."
     )
@@ -284,10 +368,11 @@ def build_dispatcher(
         if not a:
             return
         await state.clear()
+        await ensure_status_data(a, bybit_clients[a.name])
         st = load_account(a.name)
         await m.answer(
             status_text(a, st),
-            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            reply_markup=main_kb(st),
             parse_mode="HTML",
         )
 
@@ -296,10 +381,11 @@ def build_dispatcher(
         a = acct_for_msg(m)
         if not a:
             return
+        await ensure_status_data(a, bybit_clients[a.name])
         st = load_account(a.name)
         await m.answer(
             status_text(a, st),
-            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            reply_markup=main_kb(st),
             parse_mode="HTML",
         )
 
@@ -319,34 +405,41 @@ def build_dispatcher(
             await _handle_close(bot, a, bybit_clients[a.name], q)
             return
 
+        if data.startswith("sell:"):
+            parts = data.split(":")
+            if len(parts) != 3 or parts[1] != a.name:
+                await q.answer("Кнопка не относится к вашему аккаунту.", show_alert=True)
+                return
+            try:
+                idx = int(parts[2])
+            except ValueError:
+                await q.answer("Некорректная кнопка.", show_alert=True)
+                return
+            if not (1 <= idx <= 4):
+                await q.answer("Некорректная кнопка.", show_alert=True)
+                return
+            await _handle_partial_sell(bot, a, bybit_clients[a.name], q, idx)
+            return
+
         st = load_account(a.name)
         if data == "status":
-            await _safe_edit_callback_msg(
-                q, status_text(a, st),
-                main_kb(bool(st.get("fee_neutralize_enabled"))),
-            )
+            await ensure_status_data(a, bybit_clients[a.name])
+            st = load_account(a.name)
+            await _safe_edit_callback_msg(q, status_text(a, st), main_kb(st))
         elif data == "enable":
             st = update_account(a.name, enabled=True)
-            await _safe_edit_callback_msg(
-                q, status_text(a, st),
-                main_kb(bool(st.get("fee_neutralize_enabled"))),
-            )
+            await _safe_edit_callback_msg(q, status_text(a, st), main_kb(st))
             await q.answer("Торговля включена")
             return
         elif data == "disable":
             st = update_account(a.name, enabled=False)
-            await _safe_edit_callback_msg(
-                q, status_text(a, st),
-                main_kb(bool(st.get("fee_neutralize_enabled"))),
-            )
+            await _safe_edit_callback_msg(q, status_text(a, st), main_kb(st))
             await q.answer("Торговля выключена")
             return
         elif data == "toggle_fn":
             new_val = not bool(st.get("fee_neutralize_enabled") or False)
             st = update_account(a.name, fee_neutralize_enabled=new_val)
-            await _safe_edit_callback_msg(
-                q, status_text(a, st), main_kb(new_val),
-            )
+            await _safe_edit_callback_msg(q, status_text(a, st), main_kb(st))
             await q.answer(
                 "Нейтрализация комиссии: ВКЛ" if new_val
                 else "Нейтрализация комиссии: ВЫКЛ"
@@ -372,6 +465,20 @@ def build_dispatcher(
                 "(0 — отключить, например, <code>200</code> при плече 50x = +4% к цене):",
                 parse_mode="HTML",
             )
+        elif data.startswith("set_sell_"):
+            try:
+                idx = int(data.split("_")[-1])
+            except ValueError:
+                await q.answer("Некорректная кнопка.", show_alert=True)
+                return
+            if not (1 <= idx <= 4):
+                await q.answer("Некорректная кнопка.", show_alert=True)
+                return
+            await state.set_state(getattr(Form, f"sell_pct_{idx}"))
+            await q.message.answer(
+                f"Введите % продажи для кнопки №{idx} (0.1–100, например <code>50</code>):",
+                parse_mode="HTML",
+            )
 
         await q.answer()
 
@@ -392,7 +499,7 @@ def build_dispatcher(
         await m.answer(
             f"💰 Сумма: <b>{v} USD</b>",
             parse_mode="HTML",
-            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            reply_markup=main_kb(st),
         )
 
     @dp.message(Form.leverage)
@@ -412,7 +519,7 @@ def build_dispatcher(
         await m.answer(
             f"📊 Плечо: <b>{v}x</b>",
             parse_mode="HTML",
-            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            reply_markup=main_kb(st),
         )
 
     @dp.message(Form.stop)
@@ -432,7 +539,7 @@ def build_dispatcher(
         await m.answer(
             f"🛑 Стоп-лосс: <b>{v}% маржи</b>",
             parse_mode="HTML",
-            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            reply_markup=main_kb(st),
         )
 
     @dp.message(Form.take_profit)
@@ -453,8 +560,43 @@ def build_dispatcher(
         await m.answer(
             f"🎯 Тейк-профит: {label}",
             parse_mode="HTML",
-            reply_markup=main_kb(bool(st.get("fee_neutralize_enabled"))),
+            reply_markup=main_kb(st),
         )
+
+    async def _in_sell_pct(m: Message, state: FSMContext, idx: int) -> None:
+        a = acct_for_msg(m)
+        if not a:
+            return
+        try:
+            v = float((m.text or "").replace(",", ".").strip())
+            if not (0 < v <= 100):
+                raise ValueError
+        except ValueError:
+            await m.answer("Введите число от 0.1 до 100:")
+            return
+        st = update_account(a.name, **{f"sell_pct_{idx}": v})
+        await state.clear()
+        await m.answer(
+            f"💸 Кнопка продажи №{idx}: <b>{v:g}%</b>",
+            parse_mode="HTML",
+            reply_markup=main_kb(st),
+        )
+
+    @dp.message(Form.sell_pct_1)
+    async def in_sell_1(m: Message, state: FSMContext) -> None:
+        await _in_sell_pct(m, state, 1)
+
+    @dp.message(Form.sell_pct_2)
+    async def in_sell_2(m: Message, state: FSMContext) -> None:
+        await _in_sell_pct(m, state, 2)
+
+    @dp.message(Form.sell_pct_3)
+    async def in_sell_3(m: Message, state: FSMContext) -> None:
+        await _in_sell_pct(m, state, 3)
+
+    @dp.message(Form.sell_pct_4)
+    async def in_sell_4(m: Message, state: FSMContext) -> None:
+        await _in_sell_pct(m, state, 4)
 
     return dp
 
@@ -539,6 +681,129 @@ async def _handle_close(
     set_position(account.name, None)
 
 
+async def _handle_partial_sell(
+    bot: Bot,
+    account: AccountConfig,
+    bybit: BybitFutures,
+    q: CallbackQuery,
+    button_idx: int,
+) -> None:
+    st = load_account(account.name)
+    pos = st.get("position") or {}
+    if not pos.get("symbol"):
+        await q.answer("Позиция уже закрыта.", show_alert=False)
+        return
+    if pos.get("closing"):
+        await q.answer("Закрытие уже выполняется.", show_alert=False)
+        return
+
+    pct = float(st.get(f"sell_pct_{button_idx}") or 0)
+    if pct <= 0 or pct > 100:
+        await q.answer(
+            "Сначала задайте % для этой кнопки в /start.", show_alert=True,
+        )
+        return
+
+    # 100% behaves identically to the existing close-position flow — let
+    # that one handle SL/TP order cleanup and the closed-card rendering.
+    if pct >= 100:
+        await _handle_close(bot, account, bybit, q)
+        return
+
+    await q.answer(f"Продаю {pct:g}%…")
+
+    side = str(pos.get("side") or "Long")
+    position_side = "Buy" if side.lower().startswith("l") else "Sell"
+
+    try:
+        live_pos = await bybit.get_open_position(account.symbol)
+    except Exception as e:  # noqa: BLE001
+        await q.message.answer(
+            f"❌ <code>{html.escape(account.name)}</code> · "
+            f"Не удалось прочитать позицию: <code>{html.escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        return
+    if not live_pos or Decimal(str(live_pos.get("size") or "0")) <= 0:
+        await q.answer("Позиция уже закрыта.", show_alert=False)
+        return
+    live_size = Decimal(str(live_pos.get("size")))
+
+    try:
+        info = await bybit.instrument_info(account.symbol)
+    except Exception as e:  # noqa: BLE001
+        await q.message.answer(
+            f"❌ <code>{html.escape(account.name)}</code> · "
+            f"Не удалось прочитать инструмент: <code>{html.escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        return
+    lot = info.get("lotSizeFilter") or {}
+    qty_step = str(lot.get("qtyStep") or "1")
+    min_qty = str(lot.get("minOrderQty") or qty_step)
+
+    target = live_size * Decimal(str(pct)) / Decimal(100)
+    qty_str = _qty_step_floor(float(target), qty_step)
+    if Decimal(qty_str) < Decimal(min_qty):
+        await q.message.answer(
+            f"⚠️ <code>{html.escape(account.name)}</code> · "
+            f"{pct:g}% от позиции ({live_size}) меньше минимального шага "
+            f"({min_qty}). Увеличьте % или используйте «Закрыть позицию».",
+            parse_mode="HTML",
+        )
+        return
+    if Decimal(qty_str) >= live_size:
+        await _handle_close(bot, account, bybit, q)
+        return
+
+    try:
+        await bybit.close_position_market(
+            account.symbol, qty_str, position_side=position_side,
+        )
+    except BybitError as e:
+        await q.message.answer(
+            f"❌ <code>{html.escape(account.name)}</code> · "
+            f"Частичная продажа не удалась: <code>{html.escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("partial sell failed")
+        await q.message.answer(
+            f"❌ <code>{html.escape(account.name)}</code> · "
+            f"Ошибка продажи: <code>{html.escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Best-effort fill price for the realized-pnl notification — ticker is
+    # the closest fast proxy and matches the existing close flow.
+    try:
+        tk = await bybit.ticker(account.symbol)
+        exit_price = Decimal(str(tk.get("lastPrice") or tk.get("markPrice") or 0))
+    except Exception:  # noqa: BLE001
+        exit_price = Decimal(str(pos.get("entry_price") or 0))
+    entry = Decimal(str(pos.get("entry_price") or 0))
+    sold = Decimal(qty_str)
+    realized = (
+        (exit_price - entry) * sold
+        if position_side == "Buy"
+        else (entry - exit_price) * sold
+    )
+    sign = "+" if realized >= 0 else ""
+
+    remaining = live_size - sold
+    patch_position(account.name, qty=str(remaining))
+
+    await q.message.answer(
+        f"💸 <code>{html.escape(account.name)}</code> · "
+        f"Продано <b>{qty_str}</b> ({pct:g}%) по ~<b>{exit_price}</b> · "
+        f"PnL: <b>{sign}{realized:.4f} USDT</b>\n"
+        f"Осталось в позиции: <b>{remaining}</b>",
+        parse_mode="HTML",
+    )
+
+
 async def _live_tick(
     bot: Bot,
     account: AccountConfig,
@@ -557,7 +822,7 @@ async def _live_tick(
     if last <= 0:
         return
     text = render_live_card(account, pos, last)
-    kb = close_kb(account.name)
+    kb = close_kb(account.name, _sell_pcts(st))
     for entry in pos.get("messages", []) or []:
         await _safe_edit(
             bot,
@@ -592,12 +857,7 @@ def _extract_usdt(wallet_resp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _balance_tick(account: AccountConfig, bybit: BybitFutures) -> None:
-    pos = (load_account(account.name) or {}).get("position")
-    if not pos or not pos.get("symbol"):
-        # No position → drop the cached entry so a stale value can't render.
-        _BALANCE_CACHE.pop(account.name, None)
-        return
+async def _refresh_balance(account: AccountConfig, bybit: BybitFutures) -> None:
     try:
         wb = await bybit.wallet_balance("UNIFIED")
     except Exception as e:  # noqa: BLE001
@@ -612,6 +872,40 @@ async def _balance_tick(account: AccountConfig, bybit: BybitFutures) -> None:
         "available": usdt.get("availableToWithdraw") or usdt.get("availableBalance"),
         "ts": int(time.time() * 1000),
     }
+
+
+async def _refresh_fee_rate(account: AccountConfig, bybit: BybitFutures) -> None:
+    try:
+        fee = await bybit.fee_rate(account.symbol)
+    except Exception as e:  # noqa: BLE001
+        log.debug("fee_rate failed for %s: %s", account.name, e)
+        return
+    _FEE_CACHE[account.name] = {"fee": fee, "ts": int(time.time() * 1000)}
+
+
+async def ensure_status_data(account: AccountConfig, bybit: BybitFutures) -> None:
+    """Make sure the balance + fee caches are populated before rendering
+    the status card. Reuses fresh values to avoid hammering the API on
+    back-to-back /start or refresh clicks."""
+    now = int(time.time() * 1000)
+    tasks = []
+    bal = _BALANCE_CACHE.get(account.name)
+    if not bal or now - int(bal.get("ts") or 0) > STATUS_BALANCE_TTL_MS:
+        tasks.append(_refresh_balance(account, bybit))
+    fee = _FEE_CACHE.get(account.name)
+    if not fee or now - int(fee.get("ts") or 0) > FEE_CACHE_TTL_MS:
+        tasks.append(_refresh_fee_rate(account, bybit))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _balance_tick(account: AccountConfig, bybit: BybitFutures) -> None:
+    pos = (load_account(account.name) or {}).get("position")
+    if not pos or not pos.get("symbol"):
+        # Idle → no need for high-cadence updates. The /start refresh path
+        # still updates _BALANCE_CACHE via ensure_status_data on demand.
+        return
+    await _refresh_balance(account, bybit)
 
 
 async def balance_updater(
