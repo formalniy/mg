@@ -249,7 +249,7 @@ didn't go through.
 
 ```bash
 # on a fresh VPS:
-git clone https://github.com/formalniy/mg -b Bedtime_Stories
+git clone https://github.com/formalniy/mg -b Bedtime_Stories_AI
 cd mg
 sudo bash deploy/install.sh
 ```
