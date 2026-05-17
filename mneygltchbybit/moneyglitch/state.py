@@ -53,6 +53,10 @@ DEFAULT_ACCOUNT: Dict[str, Any] = {
     "sell_pct_2": 50.0,
     "sell_pct_3": 75.0,
     "sell_pct_4": 100.0,
+    # Per-user opt-in for the AI gate. When True, this account's trade only
+    # fires if the global AI (configured in ai_config.json) replies 1 for
+    # the post. Provider/key/model/prompt are NOT per-user — see ai.py.
+    "ai_enabled": False,
     "position": None,
 }
 
@@ -60,6 +64,7 @@ _LEGACY_KEYS = {
     "amount_usd", "leverage", "stop_loss_pct", "take_profit_pct",
     "fee_neutralize_enabled", "enabled",
     "sell_pct_1", "sell_pct_2", "sell_pct_3", "sell_pct_4",
+    "ai_enabled",
 }
 
 _lock = threading.Lock()

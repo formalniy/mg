@@ -23,6 +23,7 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.channels import JoinChannelRequest
 
 from .accounts import AccountConfig, load_accounts
+from .ai import AIError, ai_config_ready, ask_ai_decision, load_ai_config
 from .bybit import BybitError, BybitFutures, format_diagnostics_html
 from .notify import broadcast_card, close_button_markup, notify
 from .state import load_account, set_position
@@ -85,14 +86,46 @@ def render_open_card(
     )
 
 
+async def _run_ai_once(post_text: str) -> Dict[str, Any]:
+    """Run the global AI decision once per post.
+
+    The AI is a top-level resource (one config on the VPS, one HTTP call per
+    post). Per-user opt-in for the gate lives in `state.ai_enabled`; this
+    function does not consult per-account state.
+
+    Returns a status dict consumed by `_trade_for_account`:
+        {"status": "ok",        "decision": 0|1}
+        {"status": "disabled"}                    — ai_config.json missing/incomplete
+        {"status": "error",     "reason": str}    — call failed or unparseable
+    """
+    cfg = load_ai_config()
+    if not ai_config_ready(cfg):
+        return {"status": "disabled"}
+    try:
+        decision = await ask_ai_decision(cfg, post_text)
+    except AIError as e:
+        return {"status": "error", "reason": str(e)}
+    except Exception as e:  # noqa: BLE001
+        log.exception("global AI call failed")
+        return {"status": "error", "reason": str(e)}
+    return {"status": "ok", "decision": decision}
+
+
 async def _trade_for_account(
     account: AccountConfig,
     bybit: BybitFutures,
     bot_token: str,
     msg_id: int,
     snippet: str,
+    ai_result: Dict[str, Any],
 ) -> None:
-    """Run one open-trade flow for a single account."""
+    """Run one open-trade flow for a single account.
+
+    `ai_result` is the shared, top-level AI decision for this post (see
+    `_run_ai_once`). The account consults it only if its own `ai_enabled`
+    flag is set; otherwise the post fires the trade unconditionally (same
+    behavior as before AI was added).
+    """
     st = load_account(account.name)
     if not st["enabled"]:
         await asyncio.gather(*(
@@ -107,6 +140,45 @@ async def _trade_for_account(
         # Already in position; skip new open.
         log.info("account %s: position already open, skipping #%d", account.name, msg_id)
         return
+
+    # AI gate: only consulted when this account opted in via ai_enabled.
+    # Failure mode is conservative — any AI error skips the trade so an AI
+    # outage cannot accidentally fire a leveraged long.
+    if st.get("ai_enabled"):
+        status = ai_result.get("status")
+        if status == "disabled":
+            await asyncio.gather(*(
+                notify(bot_token, uid,
+                       f"🧠 <code>{html.escape(account.name)}</code> · "
+                       f"Пост #{msg_id} — пропущен (фильтр ИИ включён у вас, "
+                       f"но <code>ai_config.json</code> не настроен на VPS).")
+                for uid in account.user_ids
+            ))
+            return
+        if status == "error":
+            await asyncio.gather(*(
+                notify(bot_token, uid,
+                       f"🧠 <code>{html.escape(account.name)}</code> · "
+                       f"Пост #{msg_id} — пропущен (нейросеть: "
+                       f"<code>{html.escape(str(ai_result.get('reason') or ''))}</code>)")
+                for uid in account.user_ids
+            ))
+            return
+        decision = int(ai_result.get("decision") or 0)
+        if decision != 1:
+            await asyncio.gather(*(
+                notify(bot_token, uid,
+                       f"🧠 <code>{html.escape(account.name)}</code> · "
+                       f"Пост #{msg_id} — нейросеть ответила <b>0</b>, пропускаю.")
+                for uid in account.user_ids
+            ))
+            return
+        await asyncio.gather(*(
+            notify(bot_token, uid,
+                   f"🧠 <code>{html.escape(account.name)}</code> · "
+                   f"Пост #{msg_id} — нейросеть ответила <b>1</b>, открываю сделку.")
+            for uid in account.user_ids
+        ))
 
     try:
         result = await bybit.open_long_market(
@@ -223,10 +295,19 @@ async def run_parser(config: Dict[str, Any]) -> None:
             return
 
         async with trade_lock:
+            # AI runs once per post at the top level. Each account decides
+            # whether to use the result via its own ai_enabled flag. The
+            # call happens regardless of who has it enabled — for any
+            # subscribed account we still want the gate available
+            # immediately with no per-account fan-out cost.
+            ai_result = await _run_ai_once(text)
+            log.info("AI gate result for #%d: %s", msg.id, ai_result.get("status"))
             await asyncio.gather(*(
-                _trade_for_account(a, bybit_clients[a.name], bot_token, msg.id, snippet)
+                _trade_for_account(
+                    a, bybit_clients[a.name], bot_token, msg.id, snippet, ai_result,
+                )
                 for a in accounts
-            ))
+            ), return_exceptions=True)
 
     await client.start()
     try:

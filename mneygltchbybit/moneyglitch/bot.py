@@ -38,6 +38,7 @@ from aiogram.types import (
 )
 
 from .accounts import AccountConfig, account_for_user, load_accounts
+from .ai import AI_CONFIG_PATH, ai_config_ready, load_ai_config
 from .bybit import BybitError, BybitFutures, _qty_step_floor
 from .state import load_account, patch_position, set_position, update_account
 
@@ -117,8 +118,63 @@ def main_kb(st: Dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="▶️ Включить", callback_data="enable"),
             InlineKeyboardButton(text="⏸ Остановить", callback_data="disable"),
         ],
+        [InlineKeyboardButton(text="🧠 Нейронка", callback_data="ai_menu")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="status")],
     ])
+
+
+def ai_kb(st: Dict[str, Any]) -> InlineKeyboardMarkup:
+    on_label = "🧠 Фильтр ИИ: ВКЛ" if st.get("ai_enabled") else "🧠 Фильтр ИИ: ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=on_label, callback_data="ai_toggle")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="ai_menu")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="ai_back")],
+    ])
+
+
+def _mask_key(key: str) -> str:
+    k = str(key or "")
+    if not k:
+        return "—"
+    if len(k) <= 8:
+        return "•" * len(k)
+    return f"{k[:4]}…{k[-4:]}"
+
+
+def _ai_provider_label(provider: str) -> str:
+    p = (provider or "").strip().lower()
+    if p == "openrouter":
+        return "OpenRouter"
+    if p in ("huggingface", "hf"):
+        return "Hugging Face"
+    return provider or "—"
+
+
+def ai_text(account: AccountConfig, st: Dict[str, Any]) -> str:
+    flag = "✅ ВКЛ" if st.get("ai_enabled") else "⏸ ВЫКЛ"
+    cfg = load_ai_config()
+    ready = ai_config_ready(cfg)
+    provider = _ai_provider_label(str(cfg.get("provider") or ""))
+    model = str(cfg.get("model") or "—")
+    prompt = str(cfg.get("system_prompt") or "")
+    if len(prompt) > 200:
+        prompt = prompt[:200] + "…"
+    prompt_line = html.escape(prompt) if prompt else "—"
+    cfg_state = "✅ настроена" if ready else "⚠️ не настроена"
+    return (
+        f"<b>🧠 Нейронка</b> · <code>{html.escape(account.name)}</code>\n"
+        f"Фильтр у вас: <b>{flag}</b>\n\n"
+        f"<b>Глобальные настройки</b> (на VPS, файл "
+        f"<code>{html.escape(str(AI_CONFIG_PATH))}</code>)\n"
+        f"Состояние: <b>{cfg_state}</b>\n"
+        f"Провайдер: <b>{html.escape(provider)}</b>\n"
+        f"Модель: <code>{html.escape(model)}</code>\n"
+        f"API ключ: <code>{html.escape(_mask_key(str(cfg.get('api_key') or '')))}</code>\n"
+        f"Промпт: {prompt_line}\n\n"
+        "Если фильтр <b>ВКЛ</b>, ваша сделка откроется только когда нейросеть "
+        "вернёт <code>1</code> по этому посту. При <b>ВЫКЛ</b> работает обычное "
+        "правило: открываем сделку при каждом посте с TON (если торговля включена)."
+    )
 
 
 def close_kb(account_name: str, sell_pcts: List[float]) -> InlineKeyboardMarkup:
@@ -465,6 +521,16 @@ def build_dispatcher(
                 "(0 — отключить, например, <code>200</code> при плече 50x = +4% к цене):",
                 parse_mode="HTML",
             )
+        elif data == "ai_menu":
+            await _safe_edit_callback_msg(q, ai_text(a, st), ai_kb(st))
+        elif data == "ai_back":
+            await _safe_edit_callback_msg(q, status_text(a, st), main_kb(st))
+        elif data == "ai_toggle":
+            new_val = not bool(st.get("ai_enabled") or False)
+            st = update_account(a.name, ai_enabled=new_val)
+            await _safe_edit_callback_msg(q, ai_text(a, st), ai_kb(st))
+            await q.answer("Фильтр ИИ: ВКЛ" if new_val else "Фильтр ИИ: ВЫКЛ")
+            return
         elif data.startswith("set_sell_"):
             try:
                 idx = int(data.split("_")[-1])

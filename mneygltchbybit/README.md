@@ -65,6 +65,169 @@ post run concurrently:
 
 The live taker fee rate comes from `GET /v5/account/fee-rate`; fallback is `0.055%` (Bybit VIP0 linear taker).
 
+## AI-gated trading mode
+
+The parser can route the *fire/skip* decision through a neural network
+instead of trading on every TON match. The architecture mirrors how the
+parser itself works:
+
+- **The neural network is a top-level resource**, like the parser: one
+  provider, one API key, one model, one system prompt — configured on the
+  VPS in `ai_config.json`, **not** per Telegram user. The HTTP call to the
+  model is made **once per post**, regardless of how many accounts are
+  attached.
+- **Each Telegram user has a local opt-in switch** (per-account
+  `ai_enabled` in `state.json`) that decides whether the AI's `0/1` reply
+  gates *their* trade. With the switch off, the account fires the long on
+  every TON match (existing behavior); with it on, the long fires only
+  when the global AI returned `1` for that post.
+
+This matches the existing trading-flag model: the parser runs globally,
+but each user has to flip their per-account `enabled` switch **on** to
+allow trades on their account in the first place. The new `ai_enabled`
+switch sits on the same per-user axis — flipping it on adds the AI
+filter on top of the user's already-enabled trading.
+
+### Flow
+
+```
+@durov post  ──▶  parser sees "TON"
+                       │
+                       ▼
+                _run_ai_once(post_text)         ← top-level, one HTTP call per post
+                       │                          (reads ai_config.json on every call)
+                       ▼
+            ai_result = {ok | disabled | error}
+                       │
+                       ▼
+         per-account fan-out (asyncio.gather)
+                       │
+   ┌───────────────────┴────────────────────┐
+   │                                        │
+[user.enabled = false]                [user.enabled = true]
+   │                                        │
+   └─ notify "trading disabled"             │
+                                            │
+                          ┌─────────────────┴──────────────────┐
+                          │                                    │
+                   [ai_enabled = false]                  [ai_enabled = true]
+                          │                                    │
+                          ▼                                    ▼
+                   open long via Bybit             consult ai_result:
+                   (existing trade flow,
+                   unaffected by AI status)        decision = 1   → open long
+                                                   decision = 0   → notify "skip", no trade
+                                                   status = error → notify reason, no trade
+                                                   status = disabled
+                                                   (no ai_config) → notify, no trade
+```
+
+### Global AI config
+
+The parser/bot read `ai_config.json` (path overridable via the
+`MONEYGLITCH_AI_CONFIG` env var; default is the CWD). File is **re-read on
+every TON post**, so edits take effect without restarting the parser.
+
+```json
+{
+  "provider": "openrouter",
+  "api_key": "sk-or-...",
+  "model": "openrouter/owl-alpha",
+  "system_prompt": "You are a strict TON cryptocurrency trading signal classifier. Only respond 1 (buy) if the Telegram post explicitly endorses, integrates, or otherwise creates direct bullish demand for TON."
+}
+```
+
+See `ai_config.example.json`. All four fields are required for the AI to be
+considered "ready"; a missing or malformed file means the AI is *disabled*
+and any account with the per-user flag on receives a one-line notification
+explaining that the global config is missing.
+
+The provider prefix in the model name (`openrouter/owl-alpha`,
+`huggingface/meta-llama/Llama-3-8B-Instruct`) is optional and stripped
+before the HTTP call, so `owl-alpha` and `openrouter/owl-alpha` are
+equivalent when `provider` is `openrouter`.
+
+### What gets sent to the model
+
+- **System prompt**: the operator's `system_prompt` from `ai_config.json`
+  (falling back to a default English classifier brief if empty), followed
+  by a forced English output-format rule — *"Respond with EXACTLY one
+  character: '1' if the post is a positive TON signal and the long should
+  be opened, or '0' if the post should be skipped."* This wrapper is
+  always appended, so reply parsing is consistent across models.
+- **User message**: the full Telegram post body (unmodified, in whatever
+  language Pavel posted in — modern chat models handle multilingual input).
+
+### How the reply is parsed
+
+`_parse_decision` walks the model's reply and returns the first `0` or `1`
+digit it finds. Models that obey the format (`"1"`) and models that don't
+(`"Decision: 1."`, `"Output: 0"`, `"1\n\nbecause…"`) both produce a valid
+signal. If no `0` or `1` appears in the reply at all, the call raises
+`AIError` and the trade is **skipped** — the failure mode is conservative
+on purpose: an AI outage must never accidentally fire a leveraged long.
+
+### Per-user opt-in in the bot
+
+In Telegram, send `/start`, then tap **🧠 Нейронка**. The submenu shows:
+
+- **Фильтр у вас: ВКЛ / ВЫКЛ** — the per-user toggle (`state.ai_enabled`
+  under your account). Off → existing buy-every-TON behavior for you. On →
+  your trade is gated by the global AI's `0/1` reply.
+- **Глобальные настройки** — a read-only view of `ai_config.json`:
+  provider, model, masked API key (`abcd…wxyz`), and the first 200 chars
+  of the system prompt. The Telegram bot has no edit affordance for these
+  — change them by editing the file on the VPS and the next post picks up
+  the new values.
+- **🔄 Обновить** — re-fetch and re-render the global-config view.
+- **⬅️ Назад** — back to the main keyboard.
+
+The only AI field stored per-user in `state.json` is `ai_enabled` (bool).
+
+### Supported providers
+
+| Provider | Endpoint | Auth | Model field example |
+|---|---|---|---|
+| **OpenRouter** | `POST https://openrouter.ai/api/v1/chat/completions` | `Authorization: Bearer <key>` | `openrouter/owl-alpha`, `anthropic/claude-haiku-4-5-20251001` |
+| **Hugging Face** | `POST https://api-inference.huggingface.co/models/<model>` | `Authorization: Bearer <key>` | `huggingface/meta-llama/Llama-3-8B-Instruct` |
+
+OpenRouter uses the OpenAI-style `messages` schema (`role: system` +
+`role: user`). Hugging Face's Inference API expects a flat `inputs`
+string, so the system prompt and the post are concatenated with a blank
+line. In both cases the call is wrapped in a 30 s `httpx` timeout —
+exceeded timeouts surface as `AIError` and skip the trade for AI-on
+accounts.
+
+### Notifications
+
+For each AI-on account, the parser sends one of the following per post:
+
+- `🧠 <name> · Пост #<id> — нейросеть ответила 1, открываю сделку.` —
+  followed by the usual position card from `_trade_for_account`.
+- `🧠 <name> · Пост #<id> — нейросеть ответила 0, пропускаю.` — terminal.
+- `🧠 <name> · Пост #<id> — пропущен (нейросеть: <reason>)` — terminal;
+  HTTP error, timeout, or unparseable reply.
+- `🧠 <name> · Пост #<id> — пропущен (фильтр ИИ включён у вас, но
+  ai_config.json не настроен на VPS).` — terminal; operator hasn't
+  populated the global config.
+
+Accounts with AI off see none of these — they fire as before.
+
+### Cost & latency
+
+- **One HTTP call per post**, not per account. The global config is a
+  shared resource: 1 user with AI on and 50 users with AI on cost the
+  same on the model side.
+- AI gating adds one round-trip to the model provider **before** the
+  Bybit fan-out, but only for AI-on accounts — accounts with AI off
+  start the trade immediately because they ignore `ai_result`
+  regardless of its status.
+- `_run_ai_once` is awaited *before* `_trade_for_account` fans out;
+  trades for AI-off accounts therefore wait for the AI call to return
+  too. This is intentional: the parser-level `trade_lock` already
+  serializes posts, and the latency floor on `@durov` is set by
+  Telegram MTProto delivery, not by a 1-2 s OpenRouter call.
+
 On any `BybitError` the parser broadcasts the raw response **and** runs
 `gather_diagnostics(symbol)` which returns instrument info, ticker, both
 UNIFIED+CONTRACT wallet balances, and the open positions list — formatted
@@ -109,6 +272,14 @@ sudo systemctl stop moneyglitch-parser.service moneyglitch-bot.service 2>/dev/nu
 
 # 2. Fill in credentials
 sudo nano /var/lib/moneyglitch/config.json
+
+# 2b. (Optional) configure the AI gate. See ai_config.example.json. Skip
+#     this step to run with the AI feature off — accounts will still work
+#     normally, but the per-user "🧠 Нейронка" toggle will report the
+#     global config as not set.
+sudo install -o moneyglitch -g moneyglitch -m 600 \
+  ai_config.example.json /var/lib/moneyglitch/ai_config.json
+sudo nano /var/lib/moneyglitch/ai_config.json
 
 # 3. Authenticate Telethon ONCE (interactive — phone + code from Telegram)
 sudo -u moneyglitch \

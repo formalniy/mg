@@ -1,0 +1,6 @@
+{
+  "provider": "openrouter",
+  "api_key": "REPLACE_WITH_OPENROUTER_OR_HF_API_KEY",
+  "model": "openrouter/owl-alpha",
+  "system_prompt": "You are a strict TON cryptocurrency trading signal classifier. Only respond 1 (buy) if the Telegram post explicitly endorses, integrates, or otherwise creates direct bullish demand for TON. Casual mentions, neutral news, or anything off-topic must return 0."
+}
