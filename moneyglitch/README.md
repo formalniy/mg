@@ -221,7 +221,7 @@ Telegram message so you can see exactly why the order didn't go through.
 
 ```bash
 # on a fresh VPS:
-git clone <your-fork-url> mneygltchmexc
+git clone https://github.com/formalniy/mg -b MEXC200X
 cd mneygltchmexc
 sudo bash deploy/install.sh
 ```
