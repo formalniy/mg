@@ -10,6 +10,7 @@ Group=moneyglitch
 WorkingDirectory=/var/lib/moneyglitch
 Environment=MONEYGLITCH_CONFIG=/var/lib/moneyglitch/config.json
 Environment=MONEYGLITCH_STATE=/var/lib/moneyglitch/state.json
+Environment=MONEYGLITCH_AI_CONFIG=/var/lib/moneyglitch/ai_config.json
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/moneyglitch/.venv/bin/python /opt/moneyglitch/run_bot.py
 Restart=always

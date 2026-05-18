@@ -2,16 +2,32 @@
   "telegram": {
     "api_id": 123456,
     "api_hash": "REPLACE_WITH_API_HASH_FROM_my.telegram.org",
-    "session": "/var/lib/moneyglitch/parser"
-  },
-  "mexc": {
-    "api_key": "REPLACE_WITH_MEXC_FUTURES_API_KEY",
-    "secret": "REPLACE_WITH_MEXC_FUTURES_SECRET",
-    "symbol": "TON_USDT",
-    "open_type": 1
+    "session": "/var/lib/moneyglitch/parser",
+    "channel": "durov"
   },
   "bot": {
-    "token": "REPLACE_WITH_BOTFATHER_TOKEN",
-    "user_id": 0
-  }
+    "token": "REPLACE_WITH_BOTFATHER_TOKEN"
+  },
+  "accounts": [
+    {
+      "name": "main",
+      "user_ids": [111111111],
+      "mexc": {
+        "api_key": "REPLACE_WITH_MEXC_API_KEY_1",
+        "secret": "REPLACE_WITH_MEXC_SECRET_1",
+        "symbol": "TONCOIN_USDT",
+        "isolated": true
+      }
+    },
+    {
+      "name": "alt",
+      "user_ids": [222222222, 333333333],
+      "mexc": {
+        "api_key": "REPLACE_WITH_MEXC_API_KEY_2",
+        "secret": "REPLACE_WITH_MEXC_SECRET_2",
+        "symbol": "TONCOIN_USDT",
+        "isolated": true
+      }
+    }
+  ]
 }

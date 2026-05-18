@@ -1,7 +1,36 @@
-"""Shared trading state persisted as JSON.
+"""Per-account trading state persisted as JSON.
 
-Bot writes; parser reads. Atomic via tmp+rename so a half-written file
-can never be observed by the parser.
+Bot writes settings; parser writes position open/close events. Atomic via
+tmp+rename so a half-written file can never be observed.
+
+Schema:
+{
+  "accounts": {
+    "<name>": {
+      "amount_usd": 10.0,
+      "leverage": 10,
+      "stop_loss_pct": 5.0,
+      "enabled": false,
+      "position": null | {
+        "side": "Long",
+        "symbol": "TONCOIN_USDT",
+        "qty": "12.3",            // in base asset (TON)
+        "vol": "12",              // in MEXC contracts
+        "contract_size": "10",    // base per contract
+        "entry_price": "1.9046",
+        "sl_price": "1.81",
+        "leverage": 10,
+        "amount_usd": 10.0,
+        "opened_at_ms": 1778012657749,
+        "messages": [{"chat_id": 111, "message_id": 4321}, ...],
+        "closing": false
+      }
+    }
+  }
+}
+
+A legacy flat state file (DEFAULT keys at top level) is migrated on first
+read into accounts["main"].
 """
 from __future__ import annotations
 
@@ -9,43 +38,118 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 STATE_PATH = Path(os.environ.get("MONEYGLITCH_STATE", "state.json"))
 
-DEFAULT_STATE: Dict[str, Any] = {
+DEFAULT_ACCOUNT: Dict[str, Any] = {
     "amount_usd": 10.0,
     "leverage": 10,
-    "stop_loss_pct": 5.0,
+    "stop_loss_pct": 5.0,           # margin %, divided by leverage at open time
+    "take_profit_pct": 0.0,          # margin %, 0 = TP disabled
+    "fee_neutralize_enabled": False, # auto partial-TP that banks 3× est. fees
     "enabled": False,
+    # Four user-configurable quick-sell buttons. Each closes the given % of
+    # the live position via a market close order when clicked.
+    "sell_pct_1": 25.0,
+    "sell_pct_2": 50.0,
+    "sell_pct_3": 75.0,
+    "sell_pct_4": 100.0,
+    # Per-user opt-in for the AI gate. When True, this account's trade only
+    # fires if the global AI (configured in ai_config.json) replies 1 for
+    # the post. Provider/key/model/prompt are NOT per-user — see ai.py.
+    "ai_enabled": False,
+    "position": None,
+}
+
+_LEGACY_KEYS = {
+    "amount_usd", "leverage", "stop_loss_pct", "take_profit_pct",
+    "fee_neutralize_enabled", "enabled",
+    "sell_pct_1", "sell_pct_2", "sell_pct_3", "sell_pct_4",
+    "ai_enabled",
 }
 
 _lock = threading.Lock()
 
 
-def load_state() -> Dict[str, Any]:
-    with _lock:
-        if not STATE_PATH.exists():
-            _write(DEFAULT_STATE)
-            return dict(DEFAULT_STATE)
-        try:
-            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            data = {}
-        merged = dict(DEFAULT_STATE)
-        merged.update({k: v for k, v in data.items() if k in DEFAULT_STATE})
-        return merged
+def _read() -> Dict[str, Any]:
+    if not STATE_PATH.exists():
+        return {"accounts": {}}
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"accounts": {}}
+    if not isinstance(data, dict):
+        return {"accounts": {}}
+    if "accounts" in data and isinstance(data["accounts"], dict):
+        return data
+    legacy = {k: data[k] for k in _LEGACY_KEYS if k in data}
+    if legacy:
+        return {"accounts": {"main": {**DEFAULT_ACCOUNT, **legacy}}}
+    return {"accounts": {}}
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    with _lock:
-        merged = dict(DEFAULT_STATE)
-        merged.update({k: v for k, v in state.items() if k in DEFAULT_STATE})
-        _write(merged)
-
-
-def _write(state: Dict[str, Any]) -> None:
+def _write_root(root: Dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(root, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, STATE_PATH)
+
+
+def load_account(name: str) -> Dict[str, Any]:
+    with _lock:
+        root = _read()
+        accts = root.get("accounts") or {}
+        out = dict(DEFAULT_ACCOUNT)
+        out.update(accts.get(name) or {})
+        return out
+
+
+def save_account(name: str, state: Dict[str, Any]) -> None:
+    """Replace the named account state, filling missing keys with defaults."""
+    with _lock:
+        root = _read()
+        accts = root.setdefault("accounts", {})
+        prev = accts.get(name) or {}
+        accts[name] = {**DEFAULT_ACCOUNT, **prev, **state}
+        _write_root(root)
+
+
+def update_account(name: str, **fields: Any) -> Dict[str, Any]:
+    """Partial update; returns the new account state."""
+    with _lock:
+        root = _read()
+        accts = root.setdefault("accounts", {})
+        prev = accts.get(name) or {}
+        new = {**DEFAULT_ACCOUNT, **prev, **fields}
+        accts[name] = new
+        _write_root(root)
+        return dict(new)
+
+
+def get_position(name: str) -> Optional[Dict[str, Any]]:
+    return load_account(name).get("position")
+
+
+def set_position(name: str, position: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return update_account(name, position=position)
+
+
+def patch_position(name: str, **fields: Any) -> Optional[Dict[str, Any]]:
+    """Partial update of the position dict; no-op if no position."""
+    with _lock:
+        root = _read()
+        accts = root.setdefault("accounts", {})
+        prev = accts.get(name) or {}
+        pos = prev.get("position")
+        if not pos:
+            return None
+        merged = {**pos, **fields}
+        accts[name] = {**DEFAULT_ACCOUNT, **prev, "position": merged}
+        _write_root(root)
+        return dict(merged)
+
+
+def list_account_names() -> List[str]:
+    with _lock:
+        return list((_read().get("accounts") or {}).keys())
